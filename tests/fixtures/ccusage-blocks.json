@@ -1,0 +1,11 @@
+{
+  "blocks": [
+    { "isGap": false, "isActive": false, "totalTokens": 100000, "costUSD": 0.5,
+      "startTime": "2026-09-01T08:00:00.000Z", "endTime": "2026-09-01T13:00:00.000Z" },
+    { "isGap": true,  "isActive": false, "totalTokens": 0 },
+    { "isGap": false, "isActive": true,  "totalTokens": 250000, "costUSD": 1.25,
+      "burnRate": { "tokensPerMinute": 500 },
+      "projection": { "totalTokens": 400000 },
+      "startTime": "2026-09-08T10:00:00.000Z", "endTime": "2026-09-08T15:00:00.000Z" }
+  ]
+}

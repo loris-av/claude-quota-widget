@@ -49,7 +49,7 @@ Item {
     property int weekTokens: 0
     property int weekLimit: 0
     property real weekCost: 0
-    property int weekRemDays: 0
+    property int weekRemDays: -1
     property string weekReset: ""
 
     // online extras
@@ -105,7 +105,8 @@ Item {
                     root.weekActive = k.active === true
                     if (root.weekActive) {
                         root.weekPct = k.pct || 0
-                        root.weekRemDays = k.remainingDays || 0
+                        root.weekRemDays = (k.remainingDays === null || k.remainingDays === undefined)
+                                           ? -1 : k.remainingDays
                         root.weekReset = k.resetHuman || ""
                         root.weekTokens = k.tokens || 0; root.weekLimit = k.limit || 0
                         root.weekCost = k.cost || 0
@@ -216,7 +217,8 @@ Item {
                       : "Resets " + root.weekReset + "  ·  " + root.weekRemDays + "d left"
             }
             PlasmaComponents.Label {
-                Layout.fillWidth: true; visible: root.weekActive && root.source === "local"; opacity: 0.8
+                Layout.fillWidth: true; opacity: 0.8
+                visible: root.weekActive && root.source === "local" && root.weekRemDays >= 0
                 text: "Resets in " + root.weekRemDays + (root.weekRemDays === 1 ? " day" : " days")
             }
 

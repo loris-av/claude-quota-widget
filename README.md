@@ -29,7 +29,9 @@ It has two data sources:
 ## Requirements
 
 - **KDE Plasma 5** (built and tested on 5.27; Plasma 6 would need minor QML import changes).
-- `bash`, `curl`, `node`, `jq` — standard on most Linux desktops.
+- `bash`, `curl`, `node`, `jq`. Note that Plasma runs the widget with the *session*
+  `PATH`, not your shell rc — the script therefore looks for `node`/`ccusage` in the
+  usual per-user runtime locations too (nvm, fnm, bun, volta, asdf, mise, n, nodenv).
 - For **local** mode: [`ccusage`](https://github.com/ryoppippi/ccusage). No install
   needed if you have `npx` (it's fetched on demand); for speed, `npm i -g ccusage`.
 - For **online** mode: [Claude Code](https://claude.com/claude-code) logged in on the
@@ -129,7 +131,12 @@ proxy**: it's your token total divided by a denominator. By default that denomin
 the **p90 of your historical windows** (robust against one-off huge sessions); you can
 set an explicit cap in Configure once you learn where you actually hit limits.
 
-The raw `ccusage` scan is cached for 30s to avoid re-reading your transcripts every tick.
+The raw `ccusage` scan is cached for 30s to avoid re-reading your transcripts every tick,
+and is handed to `node` as a file path — a busy `~/.claude` produces a scan larger than
+`MAX_ARG_STRLEN` (128 KiB), which would fail as a command-line argument.
+
+The week-start field is read as `week` (ccusage 18.x) with `period` accepted as a
+fallback for older builds.
 
 ## Privacy & security
 
@@ -145,7 +152,11 @@ The raw `ccusage` scan is cached for 30s to avoid re-reading your transcripts ev
 
 ```bash
 ./build.sh        # produces claude-quota-<version>.plasmoid
+./tests/run-tests.sh   # data-source tests (no network, no ccusage needed)
 ```
+
+The tests drive `claude-quota-json` against recorded API bodies in `tests/fixtures/`
+via `CLAUDE_QUOTA_USAGE_FILE`, and the local path against pre-seeded cache files.
 
 CI (`.github/workflows/build.yml`) validates the package and builds the `.plasmoid` on
 every PR; pushing a `vX.Y` tag also attaches the built `.plasmoid` to a GitHub release.
@@ -162,6 +173,9 @@ package/
     config/config.qml        # config category registration
     config/main.xml          # config keys + defaults
     scripts/claude-quota-json# data-source: emits the JSON the widget renders
+tests/
+  run-tests.sh               # data-source tests
+  fixtures/                  # recorded API bodies + ccusage scans
 ```
 
 The QML never talks to the network itself — it just runs the bundled script on an
