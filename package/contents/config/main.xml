@@ -9,9 +9,11 @@
     <entry name="mode" type="String">
       <default>auto</default>
     </entry>
-    <!-- Refresh cadence in seconds. -->
+    <!-- Refresh cadence in seconds. The online endpoint rate-limits well below
+         a per-minute poll, so default to 5 minutes; stale readings are reused
+         in between and labelled with their age. -->
     <entry name="refreshSeconds" type="Int">
-      <default>60</default>
+      <default>300</default>
     </entry>
 
     <!-- LOCAL: token caps used as % denominators. 0 = auto (p90 of history). -->

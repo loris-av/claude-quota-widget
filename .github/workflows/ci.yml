@@ -23,6 +23,9 @@ jobs:
           test -f package/contents/scripts/claude-quota-json
           bash -n package/contents/scripts/claude-quota-json
 
+      - name: Run data-source tests
+        run: ./tests/run-tests.sh
+
       - name: Build .plasmoid
         run: ./build.sh
 
