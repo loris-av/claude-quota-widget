@@ -13,6 +13,9 @@
 # Local denominators (0/unset => p90 of history, ignoring outliers):
 #   CLAUDE_QUOTA_TOKEN_LIMIT, CLAUDE_QUOTA_WEEKLY_LIMIT
 # Cache: CLAUDE_QUOTA_CACHE_TTL seconds (default 30).
+# Stale online data is reused for CLAUDE_QUOTA_ONLINE_MAX_AGE seconds (default
+# 3600) when the API refuses; set 0 to disable and fall through instead.
+# Testing: CLAUDE_QUOTA_USAGE_FILE replays a recorded API body (no network).
 set -uo pipefail
 
 # ---------------------------------------------------------------------------
@@ -54,10 +57,18 @@ done
 export PATH
 
 MODE="${CLAUDE_QUOTA_MODE:-local}"
+# Reason shown when the online path gives up. Narrowed from the API's own
+# error type where it says one, so a rate limit is not reported as a bad token.
+ONLINE_ERR="online fetch failed (token invalid/expired or endpoint changed)"
 WIN_LIMIT="${CLAUDE_QUOTA_TOKEN_LIMIT:-auto}"
 WEEK_LIMIT="${CLAUDE_QUOTA_WEEKLY_LIMIT:-auto}"
 TTL="${CLAUDE_QUOTA_CACHE_TTL:-30}"
 CRED_FILE="${CLAUDE_QUOTA_CRED_FILE:-$HOME/.claude/.credentials.json}"
+# Last successful API body, replayed when the endpoint refuses (it rate-limits
+# well below a per-minute poll). Serving the stale body beats dropping to the
+# local proxy: the layout stays put and only the freshness badge changes.
+ONLINE_CACHE="${TMPDIR:-/tmp}/claude-quota-online-${UID:-$(id -u)}.json"
+ONLINE_MAX_AGE="${CLAUDE_QUOTA_ONLINE_MAX_AGE:-3600}"
 
 # Scratch file for the current write. plasmashell can tear this script down
 # between ticks, so clean it up on any exit rather than leaving empties in /tmp.
@@ -77,9 +88,104 @@ _oauth_usage() { # $1 = bearer token -> echoes response body
     "https://api.anthropic.com/api/oauth/usage" 2>/dev/null
 }
 
+# Renders an API body ($1) into the widget's JSON. $2 = age in seconds (0 =
+# just fetched). Returns non-zero if the body is not a usable usage payload.
+_render_usage() {
+  printf '%s' "$1" | node -e '
+    let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
+      let j; try { j = JSON.parse(s); } catch (e) { process.exit(1); }
+      // Cloudflare HTML / login page / anything unrecognised => bail.
+      if (!j || (!Array.isArray(j.limits) && !j.five_hour)) process.exit(1);
+
+      const now = Date.now(), DAY = 86400000;
+      // Seconds since this body was fetched. Everything time-derived below is
+      // recomputed against `now`, so a replayed body still shows correct reset
+      // times -- only the utilization figures themselves are as old as this.
+      const ageSeconds = Math.max(0, parseInt(process.argv[1], 10) || 0);
+      let tz = "";
+      try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) {}
+
+      const hhmm = d => String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+      // A session resets within the day, so a bare time reads better there;
+      // weekly limits need the date to be unambiguous.
+      const fmt = (iso, withDate) => {
+        if (!iso) return null;
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return null;
+        // en-US month name on purpose: the widget UI is English throughout, and
+        // the system locale would otherwise mix languages inside one line.
+        return withDate
+          ? d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + ", " + hhmm(d)
+          : hhmm(d);
+      };
+      const remMin  = iso => iso ? Math.max(0, Math.round((new Date(iso) - now) / 60000)) : null;
+      const remDays = iso => iso ? Math.max(0, Math.ceil((new Date(iso) - now) / DAY)) : null;
+
+      // `limits` is what /usage itself renders. Mirror its wording, and label
+      // any kind the API adds later from its own kind + scope rather than
+      // dropping it -- new limits then show up without a widget release.
+      const titleCase = k => k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      const labelFor = l => {
+        const sc = l.scope || {};
+        const name = (sc.model && sc.model.display_name) || sc.surface || null;
+        if (l.kind === "session") return "Current session";
+        if (l.kind === "weekly_all") return "Current week (all models)";
+        if (l.group === "weekly" || /^(weekly|seven_day)/.test(l.kind || ""))
+          return name ? "Current week (" + name + ")" : "Current week";
+        const base = titleCase(l.kind || "limit");
+        return name ? base + " (" + name + ")" : base;
+      };
+
+      const limits = (Array.isArray(j.limits) ? j.limits : [])
+        .filter(l => l && typeof l.percent === "number")
+        .map(l => ({
+          kind: l.kind || "",
+          label: labelFor(l),
+          pct: Math.round(l.percent),
+          severity: l.severity || "normal",
+          resetHuman: fmt(l.resets_at, l.kind !== "session"),
+          remainingMinutes: remMin(l.resets_at),
+          remainingDays: remDays(l.resets_at)
+        }));
+
+      // The compact panel view needs a session and a weekly figure. Prefer
+      // limits[]; fall back to the older top-level objects if it is absent.
+      const byKind = k => limits.find(l => l.kind === k);
+      const legacyPct = o => o && typeof o.utilization === "number" ? Math.round(o.utilization) : 0;
+      const ses = byKind("session"), wal = byKind("weekly_all");
+      const fh = j.five_hour || null, sd = j.seven_day || null;
+
+      const windowOut = ses
+        ? { active: true, pct: ses.pct, resetHuman: ses.resetHuman, remainingMinutes: ses.remainingMinutes }
+        : (fh ? { active: true, pct: legacyPct(fh), resetHuman: fmt(fh.resets_at, false), remainingMinutes: remMin(fh.resets_at) }
+              : { active: false });
+      const weekOut = wal
+        ? { active: true, pct: wal.pct, resetHuman: wal.resetHuman, remainingDays: wal.remainingDays }
+        : (sd ? { active: true, pct: legacyPct(sd), resetHuman: fmt(sd.resets_at, true), remainingDays: remDays(sd.resets_at) }
+              : { active: false });
+
+      // Only worth a line once there is something to report.
+      const eu = j.extra_usage || {};
+      const euLimit = eu.monthly_limit || 0, euUsed = eu.used_credits || 0;
+      const extra = (eu.is_enabled && (euLimit > 0 || euUsed > 0))
+        ? { enabled: true, used: euUsed, limit: euLimit, currency: eu.currency || "" }
+        : { enabled: false };
+
+      console.log(JSON.stringify({
+        source: "online", tz, limits, ageSeconds,
+        window: windowOut, week: weekOut, extra
+      }));
+    });
+  ' "$2"
+}
+
 fetch_online() {
   local resp="" token=""
-  if [ -n "${CLAUDE_QUOTA_TOKEN_B64:-}" ]; then
+  if [ -n "${CLAUDE_QUOTA_USAGE_FILE:-}" ]; then
+    # Test/debug hook: replay a recorded /api/oauth/usage body instead of
+    # calling out. Unset in normal use, so this changes nothing for users.
+    resp=$(cat "$CLAUDE_QUOTA_USAGE_FILE" 2>/dev/null)
+  elif [ -n "${CLAUDE_QUOTA_TOKEN_B64:-}" ]; then
     # Explicit override: a pasted Bearer token (note: `claude setup-token`
     # tokens lack the user:profile scope and will 403 here).
     token=$(printf '%s' "$CLAUDE_QUOTA_TOKEN_B64" | base64 -d 2>/dev/null)
@@ -93,57 +199,37 @@ fetch_online() {
     return 1
   fi
   [ -n "$resp" ] || return 1
-  printf '%s' "$resp" | node -e '
-    let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
-      let j; try { j = JSON.parse(s); } catch (e) { process.exit(1); }
-      if (!j || !j.five_hour) process.exit(1);   // Cloudflare HTML / login => bail
-      const now = Date.now(), DAY = 86400000;
-      const reset = iso => {
-        if (!iso) return { resetHuman: null, remainingMinutes: null, remainingDays: null };
-        const d = new Date(iso);
-        const hh = String(d.getHours()).padStart(2, "0");
-        const mm = String(d.getMinutes()).padStart(2, "0");
-        const mins = Math.max(0, Math.round((d - now) / 60000));
-        return {
-          resetHuman: d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " + hh + ":" + mm,
-          remainingMinutes: mins,
-          remainingDays: Math.max(0, Math.ceil((d - now) / DAY))
-        };
-      };
-      const pct = o => o && typeof o.utilization === "number" ? Math.round(o.utilization) : 0;
-
-      const fh = j.five_hour || {}, sd = j.seven_day || {};
-      const fhR = reset(fh.resets_at), sdR = reset(sd.resets_at);
-      // 5h window: time-only is clearer than a date.
-      const fhTime = fh.resets_at ? (() => { const d = new Date(fh.resets_at); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); })() : null;
-
-      const names = {
-        seven_day_opus: "Opus", seven_day_sonnet: "Sonnet",
-        seven_day_omelette: "Claude Design", seven_day_cowork: "Cowork",
-        seven_day_oauth_apps: "OAuth apps"
-      };
-      const models = [];
-      for (const k in names) if (j[k] && typeof j[k].utilization === "number")
-        models.push({ name: names[k], pct: Math.round(j[k].utilization) });
-
-      const eu = j.extra_usage || {};
-      const extra = eu.is_enabled ? {
-        enabled: true,
-        used: eu.used_credits || 0,
-        limit: eu.monthly_limit || 0,
-        currency: eu.currency || ""
-      } : { enabled: false };
-
-      console.log(JSON.stringify({
-        source: "online",
-        window: { active: true, pct: pct(fh), resetHuman: fhTime, remainingMinutes: fhR.remainingMinutes },
-        week:   { active: true, pct: pct(sd), resetHuman: sdR.resetHuman, remainingDays: sdR.remainingDays },
-        models, extra
-      }));
-    });
-  ' && return 0
-  return 1
+  # Narrow the failure reason from the API's own error type, but only when the
+  # body actually is an error envelope -- never on a successful payload.
+  case "$resp" in
+    *'"error"'*)
+      case "$resp" in
+        *rate_limit_error*)
+          ONLINE_ERR="rate limited by api.anthropic.com - retrying at next refresh"; return 1 ;;
+        *authentication_error*|*permission_error*|*invalid_request_error*)
+          ONLINE_ERR="token rejected - open Claude Code to refresh your login"; return 1 ;;
+      esac ;;
+  esac
+  _render_usage "$resp" 0 || return 1
+  # Cache only a body that actually rendered.
+  _scratch=$(mktemp "$(dirname "$ONLINE_CACHE")/claude-quota-online-XXXXXX" 2>/dev/null) \
+    && printf '%s' "$resp" > "$_scratch" && mv -f "$_scratch" "$ONLINE_CACHE" \
+    || rm -f "${_scratch:-}"
+  _scratch=""
+  return 0
 }
+
+# Replay the last good API body when the endpoint is unavailable, as long as it
+# is still within ONLINE_MAX_AGE.
+fetch_online_stale() {
+  [ "${ONLINE_MAX_AGE:-0}" -gt 0 ] 2>/dev/null || return 1
+  [ -s "$ONLINE_CACHE" ] || return 1
+  local age
+  age=$(( $(date +%s) - $(stat -c %Y "$ONLINE_CACHE" 2>/dev/null || echo 0) ))
+  [ "$age" -ge 0 ] && [ "$age" -le "$ONLINE_MAX_AGE" ] || return 1
+  _render_usage "$(cat "$ONLINE_CACHE")" "$age"
+}
+
 
 # ---------------------------------------------------------------------------
 # LOCAL: ccusage proxy (cached raw scan + p90 denominator + projection/ETA).
@@ -250,7 +336,7 @@ emit_local() {
 
 # ---------------------------------------------------------------------------
 case "$MODE" in
-  online) fetch_online || echo '{"error":"online fetch failed (token invalid/expired or endpoint changed)"}' ;;
-  auto)   fetch_online || emit_local ;;
+  online) fetch_online || fetch_online_stale || printf '{"error":"%s"}\n' "$ONLINE_ERR" ;;
+  auto)   fetch_online || fetch_online_stale || emit_local ;;
   *)      emit_local ;;
 esac

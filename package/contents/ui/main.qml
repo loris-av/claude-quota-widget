@@ -52,8 +52,15 @@ Item {
     property int weekRemDays: -1
     property string weekReset: ""
 
+    // online: the limits[] array straight from the API, already labelled and
+    // formatted by the data-source script. One entry == one bar in the popup.
+    property var limits: []
+    property string tz: ""
+    // Age of the reading. > 0 means the API refused and the last good response
+    // was replayed, so the layout holds still and only the badge changes.
+    property int ageSeconds: 0
+
     // online extras
-    property var models: []
     property bool extraEnabled: false
     property real extraUsed: 0
     property int extraLimit: 0
@@ -73,6 +80,15 @@ Item {
         var h = Math.floor(min / 60), m = min % 60
         return (h > 0 ? h + "h " : "") + m + "m"
     }
+    function ago(sec) {
+        if (sec < 60) return "<1m ago"
+        var m = Math.round(sec / 60)
+        if (m < 60) return m + "m ago"
+        return Math.round(m / 60) + "h ago"
+    }
+    function everyText(sec) {
+        return (sec >= 60 && sec % 60 === 0) ? (sec / 60) + " min" : sec + "s"
+    }
     readonly property bool winWillExceed: source === "local" && winActive && winEta >= 0 && winEta < winRemMin
 
     PlasmaCore.DataSource {
@@ -85,6 +101,7 @@ Item {
                 var j = JSON.parse(out)
                 if (j.error) {
                     root.errorMsg = j.error; root.winActive = false; root.weekActive = false
+                    root.limits = []
                 } else {
                     root.errorMsg = ""
                     root.source = j.source || "local"
@@ -112,7 +129,9 @@ Item {
                         root.weekCost = k.cost || 0
                     }
 
-                    root.models = j.models || []
+                    root.limits = j.limits || []
+                    root.tz = j.tz || ""
+                    root.ageSeconds = j.ageSeconds || 0
                     var ex = j.extra || {}
                     root.extraEnabled = ex.enabled === true
                     if (root.extraEnabled) {
@@ -122,6 +141,7 @@ Item {
                 }
             } catch (e) {
                 root.errorMsg = "parse error"; root.winActive = false; root.weekActive = false
+                root.limits = []
             }
             root.ready = true
         }
@@ -142,14 +162,29 @@ Item {
             id: compactRow
             anchors.centerIn: parent
             spacing: PlasmaCore.Units.smallSpacing
-            PlasmaCore.IconItem {
-                source: "utilities-system-monitor"
-                Layout.preferredWidth: PlasmaCore.Units.iconSizes.small
-                Layout.preferredHeight: PlasmaCore.Units.iconSizes.small
+            ClaudeMascot {
+                // Cells are 1 wide by 2 high (see ClaudeMascot), so the grid
+                // occupies 17*cw by 12*cw. Sized in whole pixels to stay crisp;
+                // the component shrinks the cell itself on a thin panel.
+                readonly property int cw: Math.max(1, Math.floor(PlasmaCore.Units.iconSizes.small / 8))
+                Layout.preferredHeight: cw * 12
+                Layout.preferredWidth: cw * 17
+                Layout.alignment: Qt.AlignVCenter
             }
             PlasmaComponents.Label {
                 text: !root.ready ? "…" : (root.winActive ? root.winPct + "%" : "idle")
                 color: root.winActive ? root.barColor(root.winPct) : Kirigami.Theme.textColor
+                font.bold: true
+            }
+            PlasmaComponents.Label {
+                visible: weekPctLabel.visible
+                text: "·"; opacity: 0.5
+            }
+            PlasmaComponents.Label {
+                id: weekPctLabel
+                visible: root.ready && root.weekActive
+                text: root.weekPct + "%"
+                color: root.barColor(root.weekPct)
                 font.bold: true
             }
         }
@@ -160,7 +195,8 @@ Item {
         Layout.minimumWidth: PlasmaCore.Units.gridUnit * 18
         Layout.minimumHeight: PlasmaCore.Units.gridUnit * 15
         Layout.preferredWidth: PlasmaCore.Units.gridUnit * 20
-        Layout.preferredHeight: PlasmaCore.Units.gridUnit * (root.source === "online" ? 21 : 17)
+        Layout.preferredHeight: PlasmaCore.Units.gridUnit *
+                                (root.source === "online" ? 6 + Math.max(1, root.limits.length) * 5 : 17)
 
         ColumnLayout {
             anchors.fill: parent
@@ -172,26 +208,86 @@ Item {
                 Layout.fillWidth: true
                 PlasmaComponents.Label { text: "Claude usage"; font.bold: true; Layout.fillWidth: true }
                 PlasmaComponents.Label {
-                    text: root.source === "online" ? "● live" : "○ local"
+                    text: root.source !== "online" ? "○ local"
+                          : (root.ageSeconds > 0 ? "● live · " + root.ago(root.ageSeconds) : "● live")
                     color: root.source === "online" ? "#27ae60" : Kirigami.Theme.textColor
-                    opacity: root.source === "online" ? 1.0 : 0.6
+                    opacity: root.source !== "online" ? 0.6 : (root.ageSeconds > 0 ? 0.7 : 1.0)
                     font.pointSize: Kirigami.Theme.smallFont.pointSize
                 }
             }
 
-            // ===== Current 5h window =====
-            PlasmaComponents.Label { text: "Current 5-hour window"; font.bold: true; Layout.fillWidth: true }
-            QuotaBar { pct: root.winPct; active: root.winActive; loading: !root.ready }
-
+            // ===== Error / first load =====
             PlasmaComponents.Label {
                 Layout.fillWidth: true
-                text: root.winActive
-                      ? (root.source === "local"
-                         ? root.fmtTokens(root.winTokens) + " / " + root.fmtTokens(root.winLimit) + " tok   ·   $" + root.winCost.toFixed(2)
-                         : "Resets " + root.winReset + "  ·  " + root.hm(root.winRemMin) + " left")
-                      : (root.errorMsg !== "" ? "Error: " + root.errorMsg : "No active window")
+                visible: root.errorMsg !== ""
+                color: root.barColor(95)
+                wrapMode: Text.WordWrap
+                text: "Error: " + root.errorMsg
             }
-            // local-only detail lines
+            QuotaBar {
+                visible: !root.ready
+                pct: 0; active: false; loading: true
+            }
+
+            // ===== ONLINE: one block per API limit, mirroring `/usage` =====
+            // Titles, order and count all come from limits[], so a limit the
+            // API starts returning shows up here on its own.
+            Repeater {
+                model: (root.source === "online" && root.errorMsg === "") ? root.limits : []
+                delegate: ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.bottomMargin: PlasmaCore.Units.smallSpacing
+                    spacing: 2
+
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        text: modelData.label
+                        font.bold: true
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: PlasmaCore.Units.smallSpacing
+                        QuotaBar {
+                            Layout.fillWidth: true
+                            pct: modelData.pct; active: true; loading: false
+                            showLabel: false
+                        }
+                        PlasmaComponents.Label {
+                            text: modelData.pct + "% used"
+                            color: root.barColor(modelData.pct)
+                            font.bold: true
+                        }
+                    }
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        visible: !!modelData.resetHuman
+                        opacity: 0.6
+                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        elide: Text.ElideRight
+                        text: "Resets " + modelData.resetHuman
+                              + (root.tz !== "" ? " (" + root.tz + ")" : "")
+                    }
+                }
+            }
+
+            // ===== LOCAL: ccusage proxy (tokens, burn rate, projection) =====
+            // ccusage cannot see the real utilization percentages, so this mode
+            // keeps its own token-proxy layout.
+            PlasmaComponents.Label {
+                text: "Current 5-hour window"; font.bold: true; Layout.fillWidth: true
+                visible: root.source === "local"
+            }
+            QuotaBar {
+                pct: root.winPct; active: root.winActive; loading: false
+                visible: root.source === "local"
+            }
+            PlasmaComponents.Label {
+                Layout.fillWidth: true
+                visible: root.source === "local"
+                text: root.winActive
+                      ? root.fmtTokens(root.winTokens) + " / " + root.fmtTokens(root.winLimit) + " tok   ·   $" + root.winCost.toFixed(2)
+                      : (root.errorMsg === "" ? "No active window" : "")
+            }
             PlasmaComponents.Label {
                 Layout.fillWidth: true; visible: root.winActive && root.source === "local"; opacity: 0.8
                 text: "Resets " + root.winReset + "  ·  " + root.hm(root.winRemMin) + " left  ·  " + root.fmtTokens(root.winBurn) + " tok/min"
@@ -205,16 +301,22 @@ Item {
                       : "Projected " + root.fmtTokens(root.winProj) + " · " + root.winProjPct + "% of cap"
             }
 
-            Item { Layout.preferredHeight: PlasmaCore.Units.smallSpacing }
+            Item {
+                Layout.preferredHeight: PlasmaCore.Units.smallSpacing
+                visible: root.source === "local"
+            }
 
-            // ===== This week =====
-            PlasmaComponents.Label { text: "This week"; font.bold: true; Layout.fillWidth: true }
-            QuotaBar { pct: root.weekPct; active: root.weekActive; loading: !root.ready }
             PlasmaComponents.Label {
-                Layout.fillWidth: true; visible: root.weekActive
-                text: root.source === "local"
-                      ? root.fmtTokens(root.weekTokens) + " / " + root.fmtTokens(root.weekLimit) + " tok   ·   $" + root.weekCost.toFixed(2)
-                      : "Resets " + root.weekReset + "  ·  " + root.weekRemDays + "d left"
+                text: "This week"; font.bold: true; Layout.fillWidth: true
+                visible: root.source === "local"
+            }
+            QuotaBar {
+                pct: root.weekPct; active: root.weekActive; loading: false
+                visible: root.source === "local"
+            }
+            PlasmaComponents.Label {
+                Layout.fillWidth: true; visible: root.weekActive && root.source === "local"
+                text: root.fmtTokens(root.weekTokens) + " / " + root.fmtTokens(root.weekLimit) + " tok   ·   $" + root.weekCost.toFixed(2)
             }
             PlasmaComponents.Label {
                 Layout.fillWidth: true; opacity: 0.8
@@ -222,24 +324,7 @@ Item {
                 text: "Resets in " + root.weekRemDays + (root.weekRemDays === 1 ? " day" : " days")
             }
 
-            // ===== Per-model + extra credits (online only) =====
-            PlasmaComponents.Label {
-                text: "Weekly by model"
-                visible: root.source === "online" && root.models.length > 0
-                opacity: 0.6
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
-                Layout.fillWidth: true
-                Layout.topMargin: PlasmaCore.Units.smallSpacing
-            }
-            Repeater {
-                model: root.source === "online" ? root.models : []
-                delegate: RowLayout {
-                    Layout.fillWidth: true
-                    spacing: PlasmaCore.Units.smallSpacing
-                    PlasmaComponents.Label { text: modelData.name; opacity: 0.85; Layout.preferredWidth: PlasmaCore.Units.gridUnit * 6 }
-                    QuotaBar { pct: modelData.pct; active: true; loading: false; Layout.fillWidth: true }
-                }
-            }
+            // ===== Extra usage credits (online, only once there is any) =====
             PlasmaComponents.Label {
                 Layout.fillWidth: true
                 visible: root.source === "online" && root.extraEnabled
@@ -254,7 +339,7 @@ Item {
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 elide: Text.ElideRight; maximumLineCount: 1
                 text: root.source === "online"
-                      ? "Real claude.ai utilization · refreshes every " + plasmoid.configuration.refreshSeconds + "s"
+                      ? "Real claude.ai utilization · refreshes every " + root.everyText(plasmoid.configuration.refreshSeconds)
                       : "Local proxy · scale " + (root.winLimit > 0 ? root.fmtTokens(root.winLimit) : "auto") + " / wk " + (root.weekLimit > 0 ? root.fmtTokens(root.weekLimit) : "auto")
             }
         }
@@ -265,6 +350,8 @@ Item {
         property int pct: 0
         property bool active: false
         property bool loading: false
+        // Online blocks render "N% used" beside the bar instead of inside it.
+        property bool showLabel: true
 
         Layout.fillWidth: true
         Layout.preferredHeight: PlasmaCore.Units.gridUnit * 1.2
@@ -281,6 +368,7 @@ Item {
         }
         PlasmaComponents.Label {
             anchors.centerIn: parent
+            visible: parent.showLabel
             text: parent.active ? parent.pct + "%" : (parent.loading ? "loading…" : "—")
             font.bold: true
         }

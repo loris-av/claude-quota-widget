@@ -17,13 +17,22 @@ It has two data sources:
 
 ## Features
 
-- **Two bars:** current 5-hour window + this week, colour-coded (green → amber → red).
-- **Online mode** shows true percentages, real reset times, per-model weekly bars
-  (e.g. Sonnet, Claude Design) and your overage-credit balance.
+- **Online mode mirrors `/usage`:** one bar per limit the API reports — current
+  session, current week (all models), current week per scoped model (e.g. Fable) —
+  with true percentages, reset times in your own timezone, and your overage-credit
+  balance. Titles and ordering come from the API, so a limit Anthropic starts
+  returning shows up without a widget update.
 - **Local mode** shows token counts, cost, burn rate, and a **projection / ETA-to-limit
   early warning** ("⚠ cap in ~22m") so you know *before* you get throttled.
 - **`auto` mode:** use online when available, fall back to local automatically.
-- Compact panel view (just the session %) that expands to the full card.
+- **Stable layout under rate limits:** the endpoint rate-limits well below a
+  per-minute poll, so a successful response is cached and replayed when the API
+  refuses — same bars, badge showing the reading's age ("● live · 3m ago") —
+  instead of the card flipping to the local layout every other tick.
+- Compact panel view (session % · week %) that expands to the full card, fronted by
+  a pixel-art Claude mascot that waves every so often. It is drawn as a grid of
+  rectangles, not an image, so it stays sharp at any panel height and costs nothing
+  between waves.
 - Everything configurable from the widget's own settings dialog.
 
 ## Requirements
@@ -102,20 +111,42 @@ GET https://api.anthropic.com/api/oauth/usage
 The `<token>` is read from your local Claude Code credentials
 (`~/.claude/.credentials.json` → `claudeAiOauth.accessToken`). That token carries the
 `user:profile` scope the endpoint requires and is auto-refreshed by Claude Code as you
-use it. The response is the real utilization, e.g.:
+use it. The response carries a `limits` array — the same one `/usage` renders — plus
+the overage-credit balance:
 
 ```json
 {
-  "five_hour": { "utilization": 16.0, "resets_at": "…T17:40:00Z" },
-  "seven_day": { "utilization":  7.0, "resets_at": "…T02:00:00Z" },
-  "seven_day_sonnet":   { "utilization": 0.0 },
-  "seven_day_omelette": { "utilization": 0.0 },
+  "limits": [
+    { "kind": "session",       "percent": 20, "resets_at": "…T16:59:59Z", "scope": null },
+    { "kind": "weekly_all",    "percent": 36, "resets_at": "…T12:59:59Z", "scope": null },
+    { "kind": "weekly_scoped", "percent": 10, "resets_at": "…T12:59:59Z",
+      "scope": { "model": { "display_name": "Fable" } } }
+  ],
   "extra_usage": { "is_enabled": true, "monthly_limit": 10000, "used_credits": 0.0, "currency": "EUR" }
 }
 ```
 
+Each entry becomes one titled bar. `kind` and `scope` produce the label
+(`session` → "Current session", `weekly_all` → "Current week (all models)",
+`weekly_scoped` → "Current week (Fable)"); an unrecognised `kind` is still shown,
+labelled from its own fields rather than dropped. Reset times are rendered in your
+local timezone, which is named under each bar. The extra-usage line only appears
+once there is a credit limit or spend to report.
+
+The older top-level `five_hour` / `seven_day` objects are still read as a fallback,
+so the widget keeps working if `limits` disappears.
+
 Auth: a pasted Bearer token override if you set one, otherwise the Claude Code login
-token. If neither works, `auto` falls back to local.
+token. When the endpoint answers with an error of its own — a rate limit, a rejected
+token — the widget reports that reason rather than guessing.
+
+**Rate limiting.** This endpoint tolerates far fewer calls than one per minute; a 60s
+poll gets `429` most of the time (Claude Code queries it too). Hence the 5-minute
+default interval, and hence the cache: the last good *raw* response is kept and, when a
+call fails, re-rendered so every derived value (reset times, minutes left) is recomputed
+against the current clock — only the utilization figures are as old as the badge says.
+Past `CLAUDE_QUOTA_ONLINE_MAX_AGE` (default 3600s) the cache is abandoned and `auto`
+drops to the local estimate.
 
 > **Note:** `claude setup-token` tokens are *inference-scoped* and lack `user:profile`,
 > so they are rejected (403) by this endpoint. Use the Claude Code login token (the default).
@@ -168,6 +199,7 @@ package/
   metadata.json              # plasmoid manifest
   contents/
     ui/main.qml              # the widget (compact + full views)
+    ui/ClaudeMascot.qml      # panel icon: pixel mascot, drawn as a grid
     ui/configGeneral.qml     # Configure → General page
     ui/configOnline.qml      # Configure → Online data page
     config/config.qml        # config category registration
@@ -187,6 +219,10 @@ This is an **unofficial** tool, not affiliated with or endorsed by Anthropic. Th
 endpoint (`/api/oauth/usage`) is **undocumented** and reverse-engineered from Claude Code;
 it can change or break at any time, in which case `auto` mode keeps working via the local
 estimate. Use it for your own account only.
+
+The panel icon is a pixel rendition of the Claude mascot, included to identify the
+service the widget reports on. "Claude" and the mascot are Anthropic's; they are not
+covered by this project's MIT licence, and their use here implies no endorsement.
 
 ## License
 
